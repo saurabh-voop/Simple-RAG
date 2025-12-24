@@ -1,9 +1,10 @@
 import json
 import re
 import hashlib
+import os
 
 class DataProcessor:
-    def __init__(self, chunk_size=350):
+    def __init__(self, chunk_size=200):
         self.chunk_size = chunk_size
         self.kb = []
         self.seen_hashes = set()
@@ -18,9 +19,9 @@ class DataProcessor:
         text = re.sub(r'\u00a0', ' ', text)
         return text.strip()
 
-    # ------------------ Deduplication ------------------
+    # ------------------ Chunk-level Deduplication ------------------
 
-    def is_duplicate(self, text: str) -> bool:
+    def is_duplicate_chunk(self, text: str) -> bool:
         text_hash = hashlib.md5(text.lower().encode("utf-8")).hexdigest()
         if text_hash in self.seen_hashes:
             return True
@@ -40,50 +41,78 @@ class DataProcessor:
 
         return chunks
 
+    # ------------------ Embedding Enrichment ------------------
+
+    def build_embedding_text(self, record, chunk):
+        return (
+            f"Loan Name: {record.get('loan_name')} | "
+            f"Section: {record.get('section')} | "
+            f"Bank: Bank of Maharashtra | "
+            f"Content: {chunk}"
+        )
+
     # ------------------ Main Processor ------------------
 
     def process(self, input_file: str):
-        with open(input_file, "r", encoding="utf-8") as f:
+        # Resolve path relative to project root
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        project_dir = os.path.dirname(base_dir)
+        filepath = os.path.join(project_dir, input_file)
+        
+        with open(filepath, "r", encoding="utf-8") as f:
             raw_data = json.load(f)
 
         chunk_id = 0
 
         for record in raw_data:
-            text = self.clean_text(record.get("text", ""))
-            if len(text) < 80:
+            raw_text = self.clean_text(record.get("text", ""))
+            if len(raw_text) < 80:
                 continue
 
-            if self.is_duplicate(text):
-                continue
-
-            chunks = self.chunk_text(text)
+            chunks = self.chunk_text(raw_text)
 
             for chunk in chunks:
+                if self.is_duplicate_chunk(chunk):
+                    continue
+
+                embedding_text = self.build_embedding_text(record, chunk)
+
                 self.kb.append({
                     "id": f"chunk_{chunk_id}",
                     "loan_name": record.get("loan_name", "Unknown Loan"),
                     "section": record.get("section", "General"),
-                    "text": chunk,
+                    "text": chunk,                         # used by LLM
+                    "embedding_text": embedding_text,     # used by retriever
                     "source_url": record.get("source_url"),
                     "tokens": len(chunk.split())
                 })
                 chunk_id += 1
 
-        print(f"[DONE] Created {len(self.kb)} RAG-ready chunks from {len(raw_data)} raw records")
+        print(
+            f"[DONE] Created {len(self.kb)} high-quality RAG chunks "
+            f"from {len(raw_data)} raw records"
+        )
         return self.kb
 
     # ------------------ Save ------------------
 
     def save(self, output_file: str):
-        with open(output_file, "w", encoding="utf-8") as f:
+        # Resolve path relative to project root
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        project_dir = os.path.dirname(base_dir)
+        filepath = os.path.join(project_dir, output_file)
+        
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        
+        with open(filepath, "w", encoding="utf-8") as f:
             json.dump(self.kb, f, indent=2, ensure_ascii=False)
 
-        print(f"[SAVED] Knowledge base → {output_file}")
+        print(f"[SAVED] Knowledge base → {filepath}")
 
 
 # ------------------ MAIN ------------------
 
 if __name__ == "__main__":
-    processor = DataProcessor(chunk_size=350)
-    processor.process("data/raw_loan_data-1.json")
-    processor.save("data/knowledge_base-1.json")
+    processor = DataProcessor(chunk_size=200)
+    processor.process("data/raw_loan_data-2.json")
+    processor.save("data/knowledge_base-201.json")

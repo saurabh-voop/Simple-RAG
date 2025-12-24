@@ -2,8 +2,9 @@ import requests
 from bs4 import BeautifulSoup
 import json
 import time
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 import os
+import re
 
 
 class BankScraper:
@@ -11,24 +12,22 @@ class BankScraper:
         self.headers = {"User-Agent": "Mozilla/5.0"}
         self.data = []
 
-        # ADD ALL LOAN URLS HERE
         self.loan_urls = [
             "https://bankofmaharashtra.bank.in/personal-banking/loans/home-loan",
             "https://bankofmaharashtra.bank.in/mahabank-vehicle-loan-scheme-for-two-wheelers-loans",
             "https://bankofmaharashtra.bank.in/maha-super-flexi-housing-loan-scheme",
             "https://bankofmaharashtra.bank.in/pradhan-mantri-awas-yojana-2",
-            "https://bankofmaharashtra.bank.in/personal-banking/loans/car-loan", 
-            "https://bankofmaharashtra.bank.in/mahabank-vehicle-loan-scheme-for-second-hand-car", 
-            "https://bankofmaharashtra.bank.in/topup-home-loan", 
-            "https://bankofmaharashtra.bank.in/educational-loans", 
-            "https://bankofmaharashtra.bank.in/gold-loan", 
+            "https://bankofmaharashtra.bank.in/personal-banking/loans/car-loan",
+            "https://bankofmaharashtra.bank.in/mahabank-vehicle-loan-scheme-for-second-hand-car",
+            "https://bankofmaharashtra.bank.in/topup-home-loan",
+            "https://bankofmaharashtra.bank.in/educational-loans",
+            "https://bankofmaharashtra.bank.in/gold-loan",
             "https://bankofmaharashtra.bank.in/personal-banking/loans/personal-loan",
             "https://bankofmaharashtra.bank.in/loan-against-property",
             "https://bankofmaharashtra.bank.in/maha-adhaar-loan",
-            "https://bankofmaharashtra.bank.in/lad", 
-            "https://bankofmaharashtra.bank.in/mahabank-green-financing-scheme", 
-            "https://bankofmaharashtra.bank.in/mahabank-rooftop-solar-panel-loan" 
-            
+            "https://bankofmaharashtra.bank.in/lad",
+            "https://bankofmaharashtra.bank.in/mahabank-green-financing-scheme",
+            "https://bankofmaharashtra.bank.in/mahabank-rooftop-solar-panel-loan"
         ]
 
     # ------------------ Utilities ------------------
@@ -50,16 +49,38 @@ class BankScraper:
             soup.find("div", class_="block-system-main-block") or
             soup.find("div", id="region-content") or
             soup.find("div", class_="region-content") or
-            soup.find("div", class_="outerWrape") or
             soup.find("main") or
             soup.body
         )
+
+    def infer_loan_name(self, soup, url):
+        # 1️⃣ h1
+        h1 = soup.find("h1")
+        if h1 and len(h1.get_text(strip=True)) > 3:
+            return h1.get_text(strip=True)
+
+        # 2️⃣ h2 page title
+        h2 = soup.find("h2")
+        if h2 and len(h2.get_text(strip=True)) > 3:
+            return h2.get_text(strip=True)
+
+        # 3️⃣ <title>
+        if soup.title:
+            title = soup.title.get_text(strip=True)
+            title = re.sub(r"\|.*", "", title)
+            if len(title) > 5:
+                return title
+
+        # 4️⃣ URL slug fallback
+        slug = urlparse(url).path.split("/")[-1]
+        slug = slug.replace("-", " ").title()
+        return slug or "Unknown Loan"
 
     def normalize_section(self, raw):
         raw = raw.lower()
         mapping = {
             "interest": "Interest Rate",
-            "processing": "Processing Fees / Charges",
+            "processing": "Processing Fees",
             "eligibility": "Eligibility",
             "document": "Documents Required",
             "margin": "Margin",
@@ -68,18 +89,15 @@ class BankScraper:
             "emi": "Repayment / EMI",
             "security": "Security / Collateral",
             "deduction": "Deductions",
-            "purpose": "Purpose of Loan",
-            "feature": "Features and Benefits",
-            "benefit": "Features and Benefits",
+            "purpose": "Purpose",
+            "feature": "Features",
+            "benefit": "Features",
             "faq": "FAQ",
-            "apply": "How to Apply",
-            "request": "Request / Processing Period"
+            "apply": "How to Apply"
         }
-
         for k, v in mapping.items():
             if k in raw:
                 return v
-
         return "General"
 
     # ------------------ Linked Page Scraper ------------------
@@ -95,12 +113,13 @@ class BankScraper:
 
         for tag in container.find_all(["p", "li"]):
             text = tag.get_text(" ", strip=True)
-            if text and len(text) > 25:
+            if text and len(text) > 30:
                 self.data.append({
                     "loan_name": loan_name,
                     "section": section,
                     "text": text,
-                    "source_url": link_url
+                    "source_url": link_url,
+                    "bank": "Bank of Maharashtra"
                 })
 
     # ------------------ Table Scraper ------------------
@@ -119,19 +138,15 @@ class BankScraper:
                 link = value_cell.find("a", href=True)
                 if link:
                     link_url = urljoin(url, link["href"])
-
-                    # store parent link (important for RAG)
                     self.data.append({
                         "loan_name": loan_name,
                         "section": section,
                         "text": f"{label}: Refer details",
+                        "source_url": url,
                         "link_url": link_url,
-                        "source_url": url
+                        "bank": "Bank of Maharashtra"
                     })
-
-                    # scrape linked page content
                     self.scrape_linked_page(link_url, loan_name, section)
-
                 else:
                     value = value_cell.get_text(" ", strip=True)
                     if value:
@@ -139,47 +154,32 @@ class BankScraper:
                             "loan_name": loan_name,
                             "section": section,
                             "text": f"{label}: {value}",
-                            "source_url": url
+                            "source_url": url,
+                            "bank": "Bank of Maharashtra"
                         })
 
     # ------------------ Section Scraper ------------------
 
     def scrape_sections(self, container, url, loan_name):
         headers = container.find_all(["h2", "h3", "h4"])
-
         for header in headers:
             section = self.normalize_section(header.get_text(strip=True))
-            collected_text = []
+            texts = []
 
             sibling = header.find_next_sibling()
-
             while sibling and sibling.name not in ["h2", "h3", "h4"]:
-                # extract links inside section
-                links = sibling.find_all("a", href=True)
-                for link in links:
-                    link_text = link.get_text(" ", strip=True) or "Related link"
-                    link_url = urljoin(url, link["href"])
-
-                    self.data.append({
-                        "loan_name": loan_name,
-                        "section": section,
-                        "text": link_text,
-                        "link_url": link_url,
-                        "source_url": url
-                    })
-
                 text = sibling.get_text(" ", strip=True)
-                if text and len(text) > 25:
-                    collected_text.append(text)
-
+                if text and len(text) > 30:
+                    texts.append(text)
                 sibling = sibling.find_next_sibling()
 
-            if collected_text:
+            if texts:
                 self.data.append({
                     "loan_name": loan_name,
                     "section": section,
-                    "text": " ".join(collected_text),
-                    "source_url": url
+                    "text": " ".join(texts),
+                    "source_url": url,
+                    "bank": "Bank of Maharashtra"
                 })
 
     # ------------------ Page Scraper ------------------
@@ -193,8 +193,7 @@ class BankScraper:
         if not container:
             return
 
-        h1 = soup.find("h1")
-        loan_name = h1.get_text(strip=True) if h1 else "Unknown Loan"
+        loan_name = self.infer_loan_name(soup, url)
 
         self.scrape_tables(container, url, loan_name)
         self.scrape_sections(container, url, loan_name)
@@ -219,9 +218,7 @@ class BankScraper:
         print(f"[DONE] Saved {len(self.data)} records → {filepath}")
 
 
-# ------------------ MAIN ------------------
-
 if __name__ == "__main__":
     scraper = BankScraper()
     scraper.scrape_all()
-    scraper.save("data/raw_loan_data-1.json")
+    scraper.save("data/raw_loan_data-2.json")

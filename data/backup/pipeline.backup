@@ -1,131 +1,126 @@
-# ------------------------------ full_rag_pipeline_improved.py ------------------------------
+# ------------------------------ full_rag_pipeline_hybrid.py ------------------------------
 
+import os
 import json
 import re
-import os
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
 from transformers import pipeline
+from sklearn.feature_extraction.text import TfidfVectorizer
 
-# ------------------ Utilities ------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(BASE_DIR)
+DATA_DIR = os.path.join(PROJECT_DIR, "data")
+
+KB_FILE = os.path.join(DATA_DIR, "knowledge_base-201.json")
+FAISS_INDEX_FILE = os.path.join(DATA_DIR, "faiss_hybrid.index")
+EMB_FILE = os.path.join(DATA_DIR, "embeddings_hybrid.npy")
+
+# ------------------ Data Processor ------------------
 
 class DataProcessor:
-    def __init__(self):
+    def __init__(self, chunk_size=350):
+        self.chunk_size = chunk_size
         self.kb = []
 
     def clean_text(self, text):
         text = re.sub(r'\s+', ' ', text)
+        text = re.sub(r'\u00a0', ' ', text)
         return text.strip()
 
-    def chunk_text(self, text, size=200):
+    def chunk_text(self, text):
         words = text.split()
         chunks = []
-        for i in range(0, len(words), size):
-            chunk = " ".join(words[i:i + size])
-            if len(chunk) > 80:
+        for i in range(0, len(words), self.chunk_size):
+            chunk = " ".join(words[i:i+self.chunk_size])
+            if len(chunk.split()) >= 40:
                 chunks.append(chunk)
         return chunks
 
     def process(self, input_file):
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        project_dir = os.path.dirname(base_dir)
-        input_file = os.path.join(project_dir, input_file)
-
         with open(input_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            raw_data = json.load(f)
 
         chunk_id = 0
-        for item in data:
-            text = self.clean_text(item.get("text", ""))
+        for record in raw_data:
+            text = self.clean_text(record.get("text", ""))
             if len(text) < 80:
                 continue
 
-            for chunk in self.chunk_text(text):
+            chunks = self.chunk_text(text)
+            for chunk in chunks:
+                embedding_text = f"Loan Name: {record.get('loan_name')} | Section: {record.get('section')} | Source: {record.get('source_url')} | Content: {chunk}"
                 self.kb.append({
                     "id": f"chunk_{chunk_id}",
-                    "loan_name": item.get("loan_name", "Unknown Loan"),
-                    "section": item.get("section", "General"),
+                    "loan_name": record.get("loan_name"),
+                    "section": record.get("section"),
                     "text": chunk,
-                    "source_url": item.get("source_url", ""),
+                    "embedding_text": embedding_text,
+                    "source_url": record.get("source_url")
                 })
                 chunk_id += 1
 
-        print(f"[INFO] Created {len(self.kb)} chunks from {len(data)} records")
+        print(f"[INFO] Created {len(self.kb)} RAG-ready chunks from {len(raw_data)} records")
         return self.kb
 
     def save(self, output_file):
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        project_dir = os.path.dirname(base_dir)
-        output_file = os.path.join(project_dir, output_file)
-
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(self.kb, f, indent=2, ensure_ascii=False)
+        print(f"[INFO] Knowledge base saved → {output_file}")
 
-        print(f"[INFO] Knowledge base saved: {output_file}")
-
-
-# ------------------ Phase 2: Strong Retrieval ------------------
+# ------------------ Retriever: Hybrid Search ------------------
 
 class Retriever:
-    def __init__(self, kb_file):
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        project_dir = os.path.dirname(base_dir)
-        kb_file = os.path.join(project_dir, kb_file)
-
-        with open(kb_file, "r", encoding="utf-8") as f:
+    def __init__(self):
+        # Load KB
+        with open(KB_FILE, "r", encoding="utf-8") as f:
             self.kb = json.load(f)
 
-        self.texts = [item["text"] for item in self.kb]
-
+        self.texts = [chunk["embedding_text"] for chunk in self.kb]
         self.model = SentenceTransformer("all-MiniLM-L6-v2")
 
-        print("[INFO] Encoding KB embeddings...")
-        embeddings = self.model.encode(
-            self.texts,
-            show_progress_bar=True,
-            normalize_embeddings=True
-        )
+        # Build/load FAISS
+        if os.path.exists(FAISS_INDEX_FILE) and os.path.exists(EMB_FILE):
+            print("[INFO] Loading cached embeddings and FAISS index")
+            self.embeddings = np.load(EMB_FILE)
+            self.index = faiss.read_index(FAISS_INDEX_FILE)
+        else:
+            print("[INFO] Creating embeddings (one-time)")
+            self.embeddings = self.model.encode(
+                self.texts,
+                normalize_embeddings=True,
+                show_progress_bar=True
+            ).astype("float32")
+            dim = self.embeddings.shape[1]
+            self.index = faiss.IndexFlatIP(dim)
+            self.index.add(self.embeddings)
+            faiss.write_index(self.index, FAISS_INDEX_FILE)
+            np.save(EMB_FILE, self.embeddings)
 
-        self.embeddings = np.array(embeddings).astype("float32")
+        # TF-IDF for keyword search
+        self.vectorizer = TfidfVectorizer(stop_words="english")
+        self.tfidf_matrix = self.vectorizer.fit_transform([chunk["text"] for chunk in self.kb])
 
-        dim = self.embeddings.shape[1]
-        self.index = faiss.IndexFlatIP(dim)  # cosine similarity
-        self.index.add(self.embeddings)
+    def hybrid_search(self, query, top_k=6):
+        # ------------------ Keyword matching ------------------
+        query_vec = self.vectorizer.transform([query])
+        tfidf_scores = (self.tfidf_matrix @ query_vec.T).toarray().flatten()
+        top_keyword_idxs = tfidf_scores.argsort()[::-1][:top_k*2]  # top 2x for overlap
 
-        print(f"[INFO] Indexed {self.index.ntotal} chunks")
+        # ------------------ Semantic FAISS search ------------------
+        query_emb = self.model.encode([query], normalize_embeddings=True).astype("float32")
+        faiss_scores, faiss_idxs = self.index.search(query_emb, top_k*2)
 
-    def enhance_query(self, query):
-        return f"{query}. Provide details, eligibility, documents, interest rate."
+        # ------------------ Combine results ------------------
+        combined_idxs = set(top_keyword_idxs[:top_k]) | set(faiss_idxs[0][:top_k])
+        results = [self.kb[i] for i in combined_idxs]
 
-    def search(self, query, top_k=8, min_score=0.25):
-        enhanced_query = self.enhance_query(query)
+        # Sort by section relevance and score heuristically
+        results = sorted(results, key=lambda x: x["loan_name"] + x["section"])
+        return results[:top_k]
 
-        query_emb = self.model.encode(
-            [enhanced_query],
-            normalize_embeddings=True
-        ).astype("float32")
-
-        scores, indices = self.index.search(query_emb, top_k)
-
-        results = []
-        for score, idx in zip(scores[0], indices[0]):
-            if score < min_score:
-                continue
-
-            item = self.kb[idx]
-            results.append({
-                "loan_name": item["loan_name"],
-                "section": item["section"],
-                "text": item["text"],
-                "source_url": item["source_url"],
-                "score": float(score)
-            })
-
-        return results
-
-
-# ------------------ Phase 3: Answer Generation ------------------
+# ------------------ Answer Generator ------------------
 
 class AnswerGenerator:
     def __init__(self):
@@ -133,16 +128,21 @@ class AnswerGenerator:
             "text2text-generation",
             model="google/flan-t5-base"
         )
+        self.chat_history = []
 
     def generate(self, query, chunks):
+        # Merge chunks for better coherence
         context = "\n\n".join(
-            f"[{c['loan_name']} | {c['section']}]\n{c['text']}"
+            f"[Loan: {c['loan_name']} | Section: {c['section']} | Source: {c['source_url']}]\n{c['text']}"
             for c in chunks
         )
 
+        history = "\n".join(self.chat_history[-4:])
         prompt = f"""
-Answer the question strictly using the context.
-If information is missing, say "Information not available".
+You are a helpful banking assistant.
+
+Conversation so far:
+{history}
 
 Context:
 {context}
@@ -150,54 +150,41 @@ Context:
 Question:
 {query}
 
-Answer:
+Answer using the context. If the exact info is not present, give the closest possible answer using the context. Include numeric values if mentioned.
 """
 
-        output = self.generator(
-            prompt,
-            max_length=350,
-            do_sample=False
-        )
+        output = self.generator(prompt, max_length=400, do_sample=False)
+        answer = output[0]["generated_text"]
 
-        return output[0]["generated_text"]
+        self.chat_history.append(f"User: {query}")
+        self.chat_history.append(f"Assistant: {answer}")
 
+        return answer
 
 # ------------------ MAIN ------------------
 
 if __name__ == "__main__":
+    # ---- Run Phase 1 only if KB does not exist ----
+    if not os.path.exists(KB_FILE):
+        processor = DataProcessor()
+        processor.process("data/raw_loan_data-2.json")
+        processor.save(KB_FILE)
 
-    raw_file = "data/raw_loan_data-1.json"
-    kb_file = "data/knowledge_base-200.json"
-
-    processor = DataProcessor()
-    processor.process(raw_file)
-    processor.save(kb_file)
-
-    retriever = Retriever(kb_file)
+    retriever = Retriever()
     generator = AnswerGenerator()
 
-    queries = [
-        "Documents required for gold loan",
-        "Interest rate for home loan",
-        "Eligibility for education loan",
-        "Processing fees for car loan"
-    ]
+    print("\nAsk questions about bank loans (type 'exit' to quit)\n")
+    while True:
+        query = input("Query: ").strip()
+        if query.lower() == "exit":
+            break
 
-    for q in queries:
-        print("\n" + "=" * 90)
-        print(f"QUERY: {q}")
-
-        retrieved = retriever.search(q)
-
-        if not retrieved:
-            print("[INFO] No relevant chunks found")
+        retrieved_chunks = retriever.hybrid_search(query)
+        if not retrieved_chunks:
+            print("No relevant information found.\n")
             continue
 
-        for r in retrieved:
-            print(f"\n[{r['loan_name']} | {r['section']}]  Score: {r['score']:.3f}")
-            print(r["text"][:300] + "...")
-            print(f"Source: {r['source_url']}")
-
-        answer = generator.generate(q, retrieved)
-        print("\n[FINAL ANSWER]")
+        answer = generator.generate(query, retrieved_chunks)
+        print("\nAnswer:")
         print(answer)
+        print("-" * 80)
